@@ -19,7 +19,7 @@ const controls = `<div id="chat-control-panel-vm" class="chat-control-panel">
 
 async function flush() { await new Promise(resolve => setImmediate(resolve)); }
 
-function setup(t, { url = 'https://live.bilibili.com/13233348', response = () => roomPayload(353609978), status = 200, withControls = true, embedded = false, online = true } = {}) {
+function setup(t, { url = 'https://live.bilibili.com/13233348', response = () => roomPayload(353609978), status = 200, withControls = true, embedded = false, online = true, native = false } = {}) {
   const dom = new JSDOM(embedded ? `<iframe src="${url}"></iframe>` : `<!doctype html><html><body>${withControls ? controls : '<main>直播页</main>'}</body></html>`, {
     url: embedded ? 'https://live.bilibili.com/13233348' : url, runScripts: 'outside-only', pretendToBeVisual: true,
   });
@@ -58,13 +58,17 @@ function setup(t, { url = 'https://live.bilibili.com/13233348', response = () =>
     const body = await response(target.searchParams.get('id'), options.signal);
     return { ok: status === 200, status, json: async () => body };
   };
+  const nativeDialog = native ? installNativeDialog(window) : null;
   window.eval(source);
   return {
-    window, requests, opened, menus,
+    window, requests, opened, menus, native: nativeDialog,
     root: () => window.document.getElementById('bili-prophecy-root')?.shadowRoot,
+    panel: () => window.document.getElementById('bili-prophecy-panel')?.shadowRoot,
+    frame() { return this.panel()?.querySelector('iframe'); },
+    tick(delay = 250) { for (const callback of [...intervals.values()]) callback(); },
     button() {
       const button = this.root()?.querySelector('[data-action="open"]');
-      assert.ok(button, 'missing standalone prediction button');
+      assert.ok(button, 'missing prediction panel button');
       return button;
     },
     menu(label = '打开直播预言') { assert.ok(menus.has(label)); menus.get(label)(); },
@@ -77,26 +81,53 @@ function setup(t, { url = 'https://live.bilibili.com/13233348', response = () =>
   };
 }
 
+// Other chat controls can still use the live room's Vue setting dialog.
+function installNativeDialog(window) {
+  const root = window.document.querySelector('#control-panel-ctnr-box');
+  root.style.position = 'relative';
+  const anchor = { x: 600, y: 700, left: 600, top: 700, width: 360, height: 110, right: 960, bottom: 810 };
+  root.getBoundingClientRect = () => anchor;
+  const node = window.document.createElement('div');
+  root.append(node);
+  const listeners = new Set(), calls = [];
+  const dialog = {
+    $el: node, $options: { components: {} }, currentContent: {}, isDialogOpen: false,
+    $on(name, fn) { listeners.add(fn); }, $off(name, fn) { listeners.delete(fn); },
+    $nextTick: fn => fn(),
+    closeDialog() { calls.push('close'); this.isDialogOpen = false; for (const fn of listeners) fn(null); },
+    mouseClose() { calls.push('mouseClose'); this.closeDialog(); },
+  };
+  node.getBoundingClientRect = () => ({ left: anchor.left, top: anchor.top - dialog.currentContent.height, width: dialog.currentContent.width, height: dialog.currentContent.height });
+  const chat = {
+    $refs: { dialog },
+    toggleDialog(content) { calls.push(content); dialog.currentContent = content; dialog.isDialogOpen = true; for (const fn of listeners) fn(content.name); },
+    closeDialog() { calls.push('scheduleClose'); this.clearCloseTimer(); this.closeDialogTimer = window.setTimeout(() => dialog.closeDialog(), 200); },
+    clearCloseTimer() { calls.push('clearClose'); window.clearTimeout(this.closeDialogTimer); },
+  };
+  root.__vue__ = chat;
+  return { chat, dialog, calls, anchor, listeners };
+}
+
 const expectedURL = 'https://live.bilibili.com/p/html/live-app-guessing-game/index.html?anchorId=353609978#/';
 
-test('the standalone button follows the three native icons above the unchanged danmaku input', async t => {
+test('the panel button mounts on the composer above the unchanged danmaku input', async t => {
   const app = setup(t);
   await flush();
   const doc = app.window.document;
   const left = doc.querySelector('.icon-left-part');
   const host = doc.getElementById('bili-prophecy-root');
-  assert.equal(host.parentNode, left);
-  assert.equal(left.lastElementChild, host);
+  assert.equal(host.parentNode, doc.getElementById('chat-control-panel-vm'));
   assert.equal(left.querySelectorAll('button').length, 3);
   assert.equal(doc.querySelector('textarea').value, '未发送内容');
   assert.equal(doc.querySelector('.send-btn').textContent, '发送');
   assert.equal(app.button().textContent, '');
   assert.equal(app.button().querySelectorAll('svg').length, 1);
-  assert.equal(app.button().getAttribute('aria-label'), '在独立窗口打开直播预言');
+  assert.equal(app.button().getAttribute('aria-label'), '打开直播预言面板');
   assert.equal(app.button().type, 'button');
   assert.equal(app.requests.length, 1);
   app.button().click();
-  assert.deepEqual(app.opened, [[expectedURL, '_blank', 'noopener,noreferrer']]);
+  assert.deepEqual(app.opened, []);
+  assert.equal(app.frame().src, expectedURL);
   assert.equal(app.root().querySelector('iframe, .panel, [data-action="toggle"]'), null);
   assert.equal(doc.querySelectorAll('#bili-prophecy-root').length, 1);
 });
@@ -106,14 +137,14 @@ test('a short room number opens the returned owner rather than treating the room
   await flush();
   app.button().click();
   assert.equal(app.requests[0].url.searchParams.get('id'), '814');
-  assert.equal(app.opened[0][0], expectedURL);
+  assert.equal(app.frame().src, expectedURL);
 });
 
-test('the blanc room route receives its own toolbar entry', async t => {
+test('the blanc room route receives its own composer entry', async t => {
   const app = setup(t, { url: 'https://live.bilibili.com/blanc/13233348?liteVersion=true' });
   await flush();
   app.button().click();
-  assert.equal(app.opened[0][0], expectedURL);
+  assert.equal(app.frame().src, expectedURL);
 });
 
 test('a live room inside an event page frame can open its owner prediction', async t => {
@@ -121,21 +152,22 @@ test('a live room inside an event page frame can open its owner prediction', asy
   assert.notEqual(app.window.top, app.window);
   await flush();
   app.button().click();
-  assert.equal(app.opened[0][0], expectedURL);
+  assert.equal(app.frame().src, expectedURL);
 });
 
-test('a late danmaku toolbar mounts the entry without adding a floating fallback', async t => {
+test('a late composer mounts the entry', async t => {
   const app = setup(t, { withControls: false });
   await flush();
   assert.equal(app.root(), undefined);
   app.addControls();
   await flush();
-  assert.equal(app.window.document.querySelector('.icon-left-part').lastElementChild.id, 'bili-prophecy-root');
+  assert.equal(app.root().host.parentElement.id, 'chat-control-panel-vm');
   app.button().click();
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
 });
 
-test('a replacement chat toolbar receives the same working entry exactly once', async t => {
+test('a replacement composer receives the same working entry exactly once', async t => {
   const app = setup(t);
   await flush();
   const host = app.window.document.getElementById('bili-prophecy-root');
@@ -145,25 +177,27 @@ test('a replacement chat toolbar receives the same working entry exactly once', 
   assert.equal(app.window.document.getElementById('bili-prophecy-root'), host);
   assert.equal(app.window.document.querySelectorAll('#bili-prophecy-root').length, 1);
   app.button().click();
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
   assert.equal(app.requests.length, 1);
 });
 
-test('a toolbar without a separate left group still receives a standalone entry', async t => {
+test('the composer receives an entry without a native toolbar', async t => {
   const app = setup(t, { withControls: false });
-  app.window.document.body.innerHTML = '<div class="chat-control-panel"><div class="control-panel-icon-row"></div><div class="chat-input-ctnr"><textarea></textarea></div></div>';
+  app.window.document.body.innerHTML = '<div class="chat-control-panel"><div class="chat-input-ctnr"><textarea></textarea></div></div>';
   await flush();
-  assert.equal(app.window.document.getElementById('bili-prophecy-root').parentNode, app.window.document.querySelector('.control-panel-icon-row'));
+  assert.equal(app.root().host.parentElement, app.window.document.querySelector('.chat-control-panel'));
   app.button().click();
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
 });
 
-test('the userscript menu opens a standalone page even if the room has no chat toolbar', async t => {
+test('the userscript menu opens a panel even if the room has no chat toolbar', async t => {
   const app = setup(t, { withControls: false });
   await flush();
   app.menu();
   assert.equal(app.root(), undefined);
-  assert.equal(app.opened[0][0], expectedURL);
+  assert.equal(app.frame().src, expectedURL);
 });
 
 for (const route of ['/', '/p/html/live-app-guessing-game/index.html?anchorId=353609978', '/123/not-a-room', '/blanc/0']) {
@@ -189,7 +223,8 @@ test('a failed owner lookup retries on click without opening a page asynchronous
   assert.equal(app.requests.length, 2);
   assert.equal(app.opened.length, 0);
   app.button().click();
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
 });
 
 test('an invalid owner uid cannot open an unrelated prediction page', async t => {
@@ -218,7 +253,8 @@ test('loading the owner disables the button and never automatically opens a wind
   assert.equal(app.opened.length, 0);
   app.button().click();
   // Recorded synchronously, while the click gesture is still active.
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
 });
 
 test('a late result from the previous room cannot replace the current owner', async t => {
@@ -231,7 +267,7 @@ test('a late result from the previous room cannot replace the current owner', as
   await flush();
   assert.equal(app.requests[0].options.signal.aborted, true);
   app.button().click();
-  assert.equal(app.opened[0][0], 'https://live.bilibili.com/p/html/live-app-guessing-game/index.html?anchorId=777#/');
+  assert.equal(app.frame().src, 'https://live.bilibili.com/p/html/live-app-guessing-game/index.html?anchorId=777#/');
 });
 
 test('leaving a room removes its entry and entering another recreates one button', async t => {
@@ -245,7 +281,8 @@ test('leaving a room removes its entry and entering another recreates one button
   await flush();
   assert.equal(app.window.document.querySelectorAll('#bili-prophecy-root').length, 1);
   app.button().click();
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
 });
 
 test('a timed-out lookup enables a retry without leaving the button busy', async t => {
@@ -281,7 +318,7 @@ test('a click immediately after an SPA route change cannot open the previous own
   assert.equal(app.opened.length, 0);
   await flush();
   app.button().click();
-  assert.equal(app.opened[0][0], 'https://live.bilibili.com/p/html/live-app-guessing-game/index.html?anchorId=777#/');
+  assert.equal(app.frame().src, 'https://live.bilibili.com/p/html/live-app-guessing-game/index.html?anchorId=777#/');
 });
 
 test('a lookup interrupted by pagehide resumes on pageshow without opening a window', async t => {
@@ -297,7 +334,8 @@ test('a lookup interrupted by pagehide resumes on pageshow without opening a win
   assert.equal(app.requests.length, 2);
   assert.equal(app.opened.length, 0);
   app.button().click();
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
 });
 
 test('the restored page resumes observing a replacement chat toolbar', async t => {
@@ -309,7 +347,8 @@ test('the restored page resumes observing a replacement chat toolbar', async t =
   app.addControls();
   await flush();
   app.button().click();
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
   assert.equal(app.requests.length, 1);
 });
 
@@ -322,7 +361,8 @@ test('reinjecting before the toolbar arrives does not duplicate requests or entr
   assert.equal(app.requests.length, 1);
   assert.equal(app.window.document.querySelectorAll('#bili-prophecy-root').length, 1);
   app.button().click();
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
 });
 
 test('an HTTP error leaves a retry entry and cannot open a prediction', async t => {
@@ -339,14 +379,14 @@ test('Shift clicking the icon opens the official participation history', async t
   const app = setup(t);
   await flush();
   app.button().dispatchEvent(new app.window.MouseEvent('click', { bubbles: true, shiftKey: true }));
-  assert.equal(app.opened[0][0], 'https://live.bilibili.com/p/html/live-app-guessing-game/index.html?anchorId=353609978#/history');
+  assert.equal(app.frame().src, 'https://live.bilibili.com/p/html/live-app-guessing-game/index.html?anchorId=353609978#/history');
 });
 
 test('history remains accessible from the menu when owner lookup fails', async t => {
   const app = setup(t, { response: () => ({ code: -400, data: null }) });
   await flush();
   app.menu('查看预言参与记录');
-  assert.equal(app.opened[0][0], 'https://live.bilibili.com/p/html/live-app-guessing-game/index.html#/history');
+  assert.equal(app.frame().src, 'https://live.bilibili.com/p/html/live-app-guessing-game/index.html#/history');
 });
 
 test('a room revisit reuses its validated owner for five minutes only', async t => {
@@ -358,7 +398,7 @@ test('a room revisit reuses its validated owner for five minutes only', async t 
   assert.equal(app.requests.length, 2);
   assert.equal(app.button().disabled, false);
   app.button().click();
-  assert.equal(app.opened[0][0], expectedURL);
+  assert.equal(app.frame().src, expectedURL);
   app.navigate('/999');
   app.advance(300001);
   app.navigate('/13233348');
@@ -378,16 +418,21 @@ test('the owner cache evicts its oldest room after 32 rooms', async t => {
   assert.equal(app.requests.length, 34);
 });
 
-test('rapid repeated opening is limited to one window per address in 600ms', async t => {
+test('repeated icon clicks toggle one iframe without reinitializing the official document', async t => {
   const app = setup(t);
   await flush();
   app.button().click();
+  const frame = app.frame(), panel = app.panel().host;
+  assert.equal(panel.hidden, false);
+  assert.equal(app.button().getAttribute('aria-expanded'), 'true');
+  app.button().click();
+  assert.equal(panel.hidden, true);
+  assert.equal(app.button().getAttribute('aria-expanded'), 'false');
   app.button().click();
   app.menu();
-  assert.equal(app.opened.length, 1);
-  app.advance(601);
-  app.button().click();
-  assert.equal(app.opened.length, 2);
+  assert.equal(panel.hidden, false);
+  assert.equal(app.frame(), frame);
+  assert.equal(app.opened.length, 0);
 });
 
 test('a transient network failure receives one automatic retry without opening a window', async t => {
@@ -471,7 +516,8 @@ test('the icon adapts when the native input background changes from dark to ligh
   await flush();
   assert.equal(host.dataset.theme, 'light');
   app.button().click();
-  assert.equal(app.opened.length, 1);
+  assert.ok(app.frame());
+  assert.equal(app.opened.length, 0);
 });
 
 test('replacing only the native input updates the icon theme and observes the replacement', async t => {
@@ -492,4 +538,337 @@ test('replacing only the native input updates the icon theme and observes the re
   await flush();
   assert.equal(host.dataset.theme, 'light');
   assert.equal(doc.querySelectorAll('#bili-prophecy-root').length, 1);
+});
+
+// A separate official document models the iframe; jsdom does not construct a
+// browsing context for frames in Shadow DOM. Chromium tests cover that boundary.
+function attachOfficial(t, app, { sdkReady = true, content = true, post = async () => ({ code: 0 }) } = {}) {
+  const frame = app.frame();
+  const dom = new JSDOM(`<!doctype html><html><body><main id="app"><div id="main">${content ? '<div class="user-detail-content"><button>官方选项</button></div>' : ''}</div></main></body></html>`, {
+    url: frame.src, runScripts: 'outside-only', pretendToBeVisual: true,
+  });
+  dom.reconfigure({ windowTop: app.window });
+  const page = dom.window;
+  Object.defineProperty(frame, 'contentWindow', { configurable: true, value: page });
+  const errors = [];
+  page.addEventListener('error', event => errors.push(event.message));
+  t.after(() => { page.close(); assert.deepEqual(errors, []); });
+  const calls = [], opened = [];
+  page.open = (...args) => opened.push(args);
+  const sdk = { getEnvSync: () => -1, Request: function OfficialRequest() {}, showConfirm() {}, openView() {} };
+  const api = { post: (...args) => { calls.push(args); return post(...args); } };
+  const modules = { 6151(module, exports) { exports.E = api; } };
+  if (sdkReady) modules[1171] = (module, exports) => { exports.Ay = sdk; };
+  const cache = new Map();
+  const require = id => {
+    if (!cache.has(id)) { const exports = {}; modules[id]({}, exports, require); cache.set(id, exports); }
+    return cache.get(id);
+  };
+  require.m = modules;
+  page.webpackChunkguessing_game = [];
+  page.webpackChunkguessing_game.push = record => { Object.assign(modules, record[1]); record[2]?.(require); };
+  app.tick();
+  return { page, sdk, api, calls, opened, adapter: page.__biliProphecyDesktopAdapter__, root: () => page.document.getElementById('bili-prophecy-desktop')?.shadowRoot };
+}
+
+test('iframe readiness requires the SDK adapter, request guard and rendered official content', async t => {
+  const app = setup(t);
+  await flush();
+  app.menu();
+  assert.equal(app.panel().querySelector('.status').hidden, false);
+  const official = attachOfficial(t, app);
+  assert.equal(official.adapter.status, 'ready');
+  assert.equal(official.adapter.apiReady, true);
+  assert.equal(app.panel().querySelector('.status').hidden, true);
+  assert.equal(app.frame().style.visibility, '');
+  app.timeout(20000);
+  assert.equal(app.panel().querySelector('.status').hidden, true);
+  const adapter = official.adapter;
+  app.tick(); app.menu(); app.menu();
+  assert.equal(official.page.__biliProphecyDesktopAdapter__, adapter);
+});
+
+for (const missing of ['sdk', 'content']) test(`iframe with missing ${missing} reaches a retryable timeout`, async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  attachOfficial(t, app, { sdkReady: missing !== 'sdk', content: missing !== 'content' });
+  app.timeout(20000);
+  assert.equal(app.panel().querySelector('.status').hidden, false);
+  assert.match(app.panel().querySelector('.status').textContent, /20 秒/);
+  const previous = app.frame();
+  app.panel().querySelector('.status button').click();
+  assert.notEqual(app.frame(), previous);
+  assert.equal(app.frame().src, expectedURL);
+  assert.equal(app.opened.length, 0);
+});
+
+test('iframe error and a blocked document both show an actionable error', async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  app.frame().dispatchEvent(new app.window.Event('error'));
+  assert.match(app.panel().querySelector('.status').textContent, /加载失败/);
+  app.panel().querySelector('.status button').click();
+  Object.defineProperty(app.frame(), 'contentWindow', { get() { throw new Error('SecurityError'); } });
+  app.tick();
+  assert.match(app.panel().querySelector('.status').textContent, /嵌入策略/);
+  assert.equal(app.opened.length, 0);
+});
+
+test('closing a confirmation cancels it once and reopening reuses the same iframe', async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  const official = attachOfficial(t, app), frame = app.frame();
+  let callbacks = 0;
+  const pending = official.sdk.showConfirm({ content: '硬币参与', callback(result) { callbacks++; assert.equal(result.confirm, false); } });
+  app.tick();
+  assert.equal(app.panel().querySelector('[data-panel-action="refresh"]').disabled, true);
+  app.panel().querySelector('[data-view="history"]').click();
+  assert.equal(official.page.location.hash, '#/');
+  app.panel().querySelector('[data-panel-action="close"]').click();
+  assert.equal((await pending).cancel, true);
+  assert.equal(callbacks, 1);
+  assert.equal(official.root().querySelector('[role="dialog"]'), null);
+  app.button().click();
+  assert.equal(app.frame(), frame);
+  assert.equal(official.calls.length, 0);
+  assert.equal(app.opened.length, 0);
+});
+
+test('refresh replaces only the iframe and preserves the selected history route', async t => {
+  const app = setup(t);
+  await flush(); app.menu('查看预言参与记录');
+  const frame = app.frame(), input = app.window.document.querySelector('textarea');
+  attachOfficial(t, app);
+  app.panel().querySelector('[data-panel-action="refresh"]').click();
+  assert.notEqual(app.frame(), frame);
+  assert.equal(app.frame().src, expectedURL.replace('#/', '#/history'));
+  assert.equal(app.window.document.querySelector('textarea'), input);
+  assert.equal(input.value, '未发送内容');
+});
+
+test('history and rules stay in the iframe and retain its anchor', async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  const official = attachOfficial(t, app), frame = app.frame();
+  app.panel().querySelector('[data-view="history"]').click();
+  assert.equal(official.page.location.hash, '#/history');
+  app.panel().querySelector('[data-view="current"]').click();
+  assert.equal(official.page.location.hash, '#/');
+  official.page.open('https://live.bilibili.com/p/html/live-app-guessing-game/index.html#/doc');
+  assert.equal(official.page.location.hash, '#/doc');
+  assert.equal(official.page.location.search, '?anchorId=353609978');
+  app.panel().querySelector('[data-view="current"]').click();
+  assert.equal(official.page.location.hash, '#/');
+  official.page.open('https://live.bilibili.com/p/html/live-app-guessing-game/index.html#/doc');
+  app.panel().querySelector('[data-panel-action="refresh"]').click();
+  assert.equal(app.frame().src, expectedURL.replace('#/', '#/doc'));
+  assert.notEqual(app.frame(), frame);
+  assert.equal(app.opened.length, 0);
+});
+
+test('an owner resolved after opening history is used when switching to current predictions', async t => {
+  let finish;
+  const app = setup(t, { response: () => new Promise(resolve => { finish = resolve; }) });
+  await flush(); app.menu('查看预言参与记录');
+  const frame = app.frame();
+  attachOfficial(t, app);
+  finish(roomPayload(353609978)); await flush();
+  app.panel().querySelector('[data-view="current"]').click();
+  assert.notEqual(app.frame(), frame);
+  assert.equal(app.frame().src, expectedURL);
+});
+
+test('switching rooms destroys the old frame and cancels its unconfirmed choice', async t => {
+  const app = setup(t, { response: id => roomPayload(id === '999' ? 777 : 353609978) });
+  await flush(); app.menu();
+  const official = attachOfficial(t, app), frame = app.frame();
+  const pending = official.sdk.showConfirm({ content: '旧房间' });
+  app.navigate('/999');
+  assert.equal((await pending).confirm, false);
+  assert.equal(app.panel(), undefined);
+  assert.equal(frame.isConnected, false);
+  await flush(); app.menu();
+  assert.match(app.frame().src, /anchorId=777/);
+});
+
+test('a room change before polling refuses a stale confirmation and participation call', async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  const official = attachOfficial(t, app);
+  app.window.history.pushState({}, '', '/999');
+  assert.equal((await official.sdk.showConfirm({ content: '旧房间' })).confirm, false);
+  await assert.rejects(official.api.post('/xlive/app-ucenter/v1/elden/user_join', {}), /离开当前直播间/);
+  assert.equal(official.calls.length, 0);
+});
+
+test('participation stays locked across the balance check and deduplicates an in-flight request', async t => {
+  let finish;
+  const app = setup(t);
+  await flush(); app.menu();
+  const official = attachOfficial(t, app, { post: () => new Promise(resolve => { finish = resolve; }) });
+  const pending = official.sdk.showConfirm({ content: '模拟参与，仅内存请求' });
+  official.root().querySelector('[data-desktop-action="confirm"]').click();
+  assert.equal((await pending).confirm, true);
+  assert.equal(official.adapter.processing, true);
+  app.tick();
+  const frame = app.frame();
+  app.panel().querySelector('[data-panel-action="refresh"]').click();
+  assert.equal(app.frame(), frame);
+  const args = { prophet_id: 1, answer: 1, anchor_id: 353609978, uid: 1 };
+  const first = official.api.post('/xlive/app-ucenter/v1/elden/user_join', args);
+  const duplicate = official.api.post('/xlive/app-ucenter/v1/elden/user_join', args);
+  assert.equal(first, duplicate);
+  await Promise.resolve();
+  assert.equal(official.calls.length, 1);
+  assert.equal(official.calls[0][1], args);
+  app.panel().querySelector('[data-panel-action="close"]').click();
+  app.button().click(); app.tick();
+  assert.equal(app.frame(), frame);
+  assert.equal(app.panel().querySelector('[data-panel-action="refresh"]').disabled, true);
+  const response = { code: -400, message: '模拟官方错误，不代表真实参与结果' };
+  finish(response);
+  assert.equal(await first, response);
+  assert.equal(official.adapter.processing, false);
+  app.tick();
+  assert.equal(app.panel().querySelector('[data-panel-action="refresh"]').disabled, false);
+});
+
+test('participation rejection releases the interaction lock without retrying', async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  const official = attachOfficial(t, app, { post: () => Promise.reject(new Error('network failure')) });
+  await assert.rejects(official.api.post('/xlive/app-ucenter/v1/elden/user_join', {}), /network failure/);
+  assert.equal(official.adapter.processing, false);
+  assert.equal(official.calls.length, 1);
+  assert.equal(official.page.document.getElementById('app').inert, false);
+});
+
+test('only the manual compatibility button opens a new tab', async t => {
+  const app = setup(t);
+  await flush(); app.menu('查看预言参与记录');
+  assert.equal(app.opened.length, 0);
+  app.panel().querySelector('[data-panel-action="external"]').click();
+  assert.deepEqual(app.opened, [[expectedURL.replace('#/', '#/history'), '_blank', 'noopener,noreferrer']]);
+});
+
+test('SDK external help requires a manual link and login remains an explicit external flow', async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  const official = attachOfficial(t, app);
+  await official.sdk.openView({ url: 'https://www.bilibili.com/blackboard/help.html' });
+  assert.equal(official.opened.length, 0);
+  assert.match(official.root().querySelector('a').textContent, /新标签页/);
+  official.page.open('https://passport.bilibili.com/login');
+  assert.equal(official.opened.length, 1);
+  official.page.open('javascript:alert(1)');
+  assert.equal(official.opened.length, 1);
+});
+
+test('a frame error while confirming cancels the choice and allows retry', async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  const official = attachOfficial(t, app);
+  const pending = official.sdk.showConfirm({ content: '加载失败时取消' });
+  app.tick();
+  app.frame().dispatchEvent(new app.window.Event('error'));
+  assert.equal((await pending).confirm, false);
+  assert.equal(app.panel().querySelector('.status button').disabled, false);
+  const old = app.frame();
+  app.panel().querySelector('.status button').click();
+  assert.notEqual(app.frame(), old);
+  assert.equal(official.calls.length, 0);
+});
+
+test('a queued participation cannot be sent after a synchronous room change', async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  const official = attachOfficial(t, app);
+  const pending = official.api.post('/xlive/app-ucenter/v1/elden/user_join', {});
+  app.navigate('/999');
+  await assert.rejects(pending, /离开当前直播间/);
+  assert.equal(official.calls.length, 0);
+});
+
+test('hover leaves the composer focused and click opens the panel above the entry', async t => {
+  const app = setup(t, { native: true });
+  await flush();
+  const input = app.window.document.querySelector('textarea');
+  input.focus();
+  app.root().host.parentElement.getBoundingClientRect = () => app.native.anchor;
+  app.root().host.getBoundingClientRect = () => ({ width: 32, top: 658, left: 918, right: 950 });
+  app.button().dispatchEvent(new app.window.MouseEvent('mouseenter'));
+  assert.equal(app.panel(), undefined);
+  assert.equal(app.window.document.activeElement, input);
+  app.button().click();
+  const host = app.panel().host;
+  assert.deepEqual(app.native.calls, []);
+  assert.equal(app.window.document.querySelector('#control-panel-ctnr-box').contains(host), false, 'panel must escape the sidebar clipping subtree');
+  assert.equal(host.getAttribute('popover'), 'manual');
+  assert.equal(host.style.position, 'fixed');
+  assert.equal(host.style.top, '50px');
+  assert.equal(host.style.left, '540px');
+  assert.equal(host.style.width, '420px');
+  assert.equal(app.opened.length, 0);
+});
+
+test('pointer leave and outside clicks keep the panel open, and click toggling reuses the iframe', async t => {
+  const app = setup(t);
+  await flush();
+  app.button().click();
+  const frame = app.frame();
+  app.button().dispatchEvent(new app.window.MouseEvent('mouseleave'));
+  app.panel().host.dispatchEvent(new app.window.MouseEvent('mouseleave'));
+  app.window.document.querySelector('.send-btn').click();
+  assert.equal(app.panel().host.hidden, false);
+  assert.equal(app.button().getAttribute('aria-expanded'), 'true');
+  app.button().click();
+  assert.equal(app.panel().host.hidden, true);
+  assert.equal(app.button().getAttribute('aria-expanded'), 'false');
+  app.button().click();
+  assert.equal(app.frame(), frame);
+});
+
+test('native settings and pending prediction confirmation stay independent', async t => {
+  const app = setup(t, { native: true });
+  await flush(); app.menu();
+  const official = attachOfficial(t, app);
+  const close = app.native.dialog.closeDialog, toggle = app.native.chat.toggleDialog;
+  const pending = official.sdk.showConfirm({ content: '打开原生设置后仍可继续确认' });
+  app.native.chat.toggleDialog({ name: 'blockSetting', contentComponentName: 'BlockSettingDialogContent' });
+  assert.equal(app.panel().host.hidden, false);
+  assert.ok(official.root().querySelector('[role="dialog"]'));
+  app.button().click();
+  assert.equal((await pending).confirm, false);
+  assert.equal(app.panel().host.hidden, true);
+  assert.equal(app.native.dialog.$el.style.opacity, '');
+  assert.equal(app.native.dialog.closeDialog, close);
+  assert.equal(app.native.chat.toggleDialog, toggle);
+  assert.equal(app.native.dialog.currentContent.name, 'blockSetting');
+});
+
+test('leaving the room removes the entry and restores a static composer', async t => {
+  const app = setup(t, { native: true });
+  await flush(); app.menu();
+  const composer = app.root().host.parentElement;
+  assert.equal(composer.style.position, 'relative');
+  app.navigate('/');
+  assert.equal(composer.style.position, '');
+  assert.equal(app.root(), undefined);
+  assert.equal(app.native.listeners.size, 0);
+  assert.equal(app.native.dialog.$options.components.BiliProphecyPanelContent, undefined);
+  assert.equal(app.native.dialog.$el.style.opacity, '');
+  assert.equal(app.panel(), undefined);
+});
+
+test('different Document wrappers do not reinitialize the same iframe or cancel its confirmation', async t => {
+  const app = setup(t);
+  await flush(); app.menu();
+  const official = attachOfficial(t, app), frame = app.frame();
+  const pending = official.sdk.showConfirm({content:'同一 iframe 的跨环境包装'});
+  official.adapter.document = { wrapper: official.page.document };
+  app.tick(); app.tick();
+  assert.ok(official.root().querySelector('[role="dialog"]'));
+  assert.equal(app.frame(), frame);
+  official.root().querySelector('[data-desktop-action="cancel"]').click();
+  assert.equal((await pending).cancel,true);
 });

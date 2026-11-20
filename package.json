@@ -3,12 +3,14 @@
   "private": true,
   "scripts": {
     "test": "node --test tests/*.test.cjs",
-    "test:prophecy": "node --test tests/live-prophecy.test.cjs tests/live-prophecy-desktop.test.cjs",
+    "test:prophecy": "node --test tests/live-prophecy.test.cjs tests/live-prophecy-desktop.test.cjs tests/live-prophecy-cards.test.cjs",
+    "test:prophecy:browser": "node tests/live-prophecy-browser.cjs",
     "test:frame": "node tests/biliframe-browser.cjs"
   },
   "devDependencies": {
     "commonmark": "0.31.2",
-    "jsdom": "26.1.0"
+    "jsdom": "26.1.0",
+    "playwright": "1.56.1"
   },
   "engines": {
     "node": ">=20"
